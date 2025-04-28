@@ -355,6 +355,86 @@ async def delete_project_item(owner: str, project_number: int, item_id: str) -> 
         return f"Error: Could not delete item. Details: {e}"
 
 
+# --- Search Tool ---
+@mcp.tool()
+async def search_project_items(  # Note: Renamed from search_project_issues for clarity
+    owner: str, project_number: int, search_query: str, limit: int = 10
+) -> str:
+    """Search for Issues or Pull Requests within a specific GitHub Project V2 using GitHub's search syntax.
+
+    This searches across GitHub issues/PRs and filters for those linked to the project.
+    It WILL NOT find Draft Issues, as they are not searchable via the standard GitHub search.
+
+    Args:
+        owner: The GitHub organization or user name that owns the project.
+        project_number: The project number.
+        search_query: The search query string. Supports GitHub issue search syntax
+                      (e.g., "bug label:backend", "assignee:user state:open keyword").
+                      Use "repo:owner/repo-name" to scope the search for efficiency.
+        limit: Maximum number of *matching project items* to return (default: 10).
+
+    Returns:
+        A formatted string listing the project items matching the search query.
+    """
+    try:
+        # 1. Call the new github_client method
+        matching_items = await github_client.search_and_filter_project_items(
+            owner=owner,
+            project_number=project_number,
+            search_query=search_query,
+            limit=limit,
+        )
+
+        if not matching_items:
+            return f"No items found in project #{project_number} matching query: '{search_query}'"
+
+        # 2. Format the results (reuse formatting logic)
+        result = (
+            f"Found items in project #{project_number} matching '{search_query}':\n\n"
+        )
+        for item in matching_items:
+            content = item.get("content", {})
+            result += f"- Item ID: {item['id']}\n"
+            item_type = content.get("__typename")
+            repo_info = content.get("repository", {})
+            repo_str = (
+                f"{repo_info.get('owner', {}).get('login')}/{repo_info.get('name')}"
+                if repo_info
+                else "N/A"
+            )
+
+            if item_type == "Issue":
+                result += f"  Type: Issue #{content.get('number')} ({repo_str})\n"
+                result += f"  Title: {content.get('title')}\n"
+                result += f"  State: {content.get('state')}\n"
+                result += f"  URL: {content.get('url')}\n"
+            elif item_type == "PullRequest":
+                result += f"  Type: PR #{content.get('number')} ({repo_str})\n"
+                result += f"  Title: {content.get('title')}\n"
+                result += f"  State: {content.get('state')}\n"
+                result += f"  URL: {content.get('url')}\n"
+            # Draft issues are not searchable via this method
+            else:
+                result += f"  Type: {item_type or 'Unknown'}\n"
+                result += f"  Content: {json.dumps(content)}\n"
+
+            # Add field values if needed
+            if item.get("fieldValues"):
+                result += f"  Field Values:\n"
+                for field_name, value in item["fieldValues"].items():
+                    result += f"    - {field_name}: {value}\n"
+
+            result += "\n"
+        return result
+
+    except GitHubClientError as e:
+        logger.error(f"Error searching project {owner}/{project_number}: {e}")
+        return f"Error searching project items. Details: {e}"
+    except ValueError as e:  # Catch potential validation errors from client
+        logger.error(f"Invalid input for search: {e}")
+        return f"Error: Invalid search input. {e}"
+
+
 # --- Helper for updating project item field ---
 # TODO: Add a helper tool to get field details (ID, name, type) to allow
 #       users/LLM to specify fields by name and provide correct value types.

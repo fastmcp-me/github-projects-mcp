@@ -989,3 +989,111 @@ class GitHubClient:
         except GitHubClientError as e:
             logger.error(f"Failed to update project {project_number}: {e}")
             raise
+
+    async def search_and_filter_project_items(
+        self, owner: str, project_number: int, search_query: str, limit: int = 10
+    ) -> List[Dict[str, Any]]:
+        """
+        Searches GitHub issues/PRs and returns items linked to the specified project.
+        """
+        logger.info(
+            f"Searching project {owner}/{project_number} for query: '{search_query}'"
+        )
+
+        # --- Step 1: Get all item IDs and content IDs from the project ---
+        # Use high limit to get most/all items - needs pagination for large projects
+        try:
+            # Fetch more items than limit to ensure filtering is effective
+            # Consider adding pagination here for very large projects
+            all_project_items = await self.get_project_items(
+                owner, project_number, limit=500
+            )
+            project_item_map: Dict[str, Dict[str, Any]] = (
+                {}
+            )  # Map content_id -> item_data
+            content_ids_in_project = set()
+            for item in all_project_items:
+                content = item.get("content")
+                if content and content.get("id"):
+                    content_id = content["id"]
+                    content_ids_in_project.add(content_id)
+                    project_item_map[content_id] = item
+
+            if not content_ids_in_project:
+                logger.info("Project has no linkable items (Issues/PRs).")
+                return []
+
+        except GitHubClientError as e:
+            logger.error(f"Could not get project items for filter: {e}")
+            raise  # Re-raise the error
+
+        # --- Step 2: Perform GitHub Search ---
+        # Add project owner context to search query if not already present
+        # Basic check, could be more robust
+        scoped_query = search_query
+        # Heuristic: Check common qualifiers. Add org:/user: if none are present.
+        if not any(
+            q in search_query.lower()
+            for q in [f"org:{owner}".lower(), f"user:{owner}".lower(), "repo:"]
+        ):
+            scoped_query = f"org:{owner} {search_query}"  # Assume org context primarily
+            logger.info(f"Scope not detected, searching within org/user: {owner}")
+
+        # Increase search result count to account for filtering
+        search_limit = min(limit * 5, 100)  # Fetch up to 5x needed, max 100 results
+
+        search_gql = """
+        query SearchProjectIssues($query: String!, $first: Int!) {
+          search(query: $query, type: ISSUE, first: $first) { # type: ISSUE searches both Issues and PRs
+            nodes {
+              ... on Issue {
+                id
+                # Minimal fields needed for filtering
+              }
+              ... on PullRequest {
+                id
+                # Minimal fields needed for filtering
+              }
+            }
+          }
+        }
+        """
+
+        search_vars = {"query": scoped_query, "first": search_limit}
+
+        try:
+            search_result_data = await self.execute_query(search_gql, search_vars)
+            search_nodes = search_result_data.get("search", {}).get("nodes", [])
+            if not search_nodes:
+                logger.info(
+                    f"GitHub search returned no results for query: '{scoped_query}'"
+                )
+                return []
+
+        except GitHubClientError as e:
+            logger.error(f"GitHub search failed: {e}")
+            raise  # Re-raise the error
+
+        # --- Step 3: Filter search results against project items & map back ---
+        matching_items_data = []
+        found_content_ids = set()
+
+        for node in search_nodes:
+            node_id = node.get("id")
+            # Check if the found issue/PR ID is one linked to our project
+            if (
+                node_id
+                and node_id in content_ids_in_project
+                and node_id not in found_content_ids
+            ):
+                # Retrieve the full project item data we stored earlier
+                matching_items_data.append(project_item_map[node_id])
+                found_content_ids.add(node_id)
+                # Stop once we have enough results matching the requested limit
+                if len(matching_items_data) >= limit:
+                    break
+
+        logger.info(
+            f"Found {len(matching_items_data)} items matching query in project."
+        )
+        return matching_items_data
