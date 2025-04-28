@@ -1006,7 +1006,7 @@ class GitHubClient:
             # Fetch more items than limit to ensure filtering is effective
             # Consider adding pagination here for very large projects
             all_project_items = await self.get_project_items(
-                owner, project_number, limit=500
+                owner, project_number, limit=100
             )
             project_item_map: Dict[str, Dict[str, Any]] = (
                 {}
