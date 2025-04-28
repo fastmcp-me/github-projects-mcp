@@ -8,13 +8,10 @@ A Model Context Protocol server that provides tools for managing GitHub Projects
 import json
 import logging
 import os
-from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
-from pydantic import BaseModel, Field
 
 from .github_client import GitHubClient, GitHubClientError
 
@@ -358,10 +355,11 @@ async def delete_project_item(owner: str, project_number: int, item_id: str) -> 
 # async def get_project_field_details(owner: str, project_number: int, field_name: str) -> str:
 #    ...
 
+
 # Main entry point function that can be imported
 def main():
     """Main entry point for the GitHub Projects MCP server.
-    
+
     Checks for required environment variables and starts the MCP server.
     """
     # Check for GitHub token
