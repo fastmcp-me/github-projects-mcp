@@ -8,7 +8,7 @@ A Model Context Protocol server that provides tools for managing GitHub Projects
 import json
 import logging
 import os
-from typing import Any
+from typing import Any, Optional
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
@@ -114,24 +114,32 @@ async def get_project_fields(owner: str, project_number: int) -> str:
 
 
 @mcp.tool()
-async def get_project_items(owner: str, project_number: int, limit: int = 20) -> str:
+async def get_project_items(
+    owner: str, project_number: int, limit: int = 20, state: Optional[str] = None
+) -> str:
     """Get items in a GitHub Project V2.
 
     Args:
         owner: The GitHub organization or user name
         project_number: The project number
         limit: Maximum number of items to return (default: 20)
+        state: Optional state to filter items by (e.g., "OPEN", "CLOSED").
+               Applies only to linked Issues and Pull Requests, not Draft Issues.
 
     Returns:
         A formatted string with item details
     """
     try:
-        items = await github_client.get_project_items(owner, project_number, limit)
+        items = await github_client.get_project_items(
+            owner, project_number, limit, state
+        )
 
         if not items:
-            return f"No items found in project #{project_number} for {owner}"
+            state_msg = f" with state '{state.upper()}'" if state else ""
+            return f"No items found in project #{project_number} for {owner}{state_msg}"
 
-        result = f"Items in project #{project_number} for {owner}:\n\n"
+        state_msg = f" (State: {state.upper()})" if state else ""
+        result = f"Items in project #{project_number} for {owner}{state_msg}:\n\n"
         for item in items:
             content = item.get("content", {})
             result += f"- Item ID: {item['id']}\n"

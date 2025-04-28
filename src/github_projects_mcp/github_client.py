@@ -346,14 +346,20 @@ class GitHubClient:
             raise
 
     async def get_project_items(
-        self, owner: str, project_number: int, limit: int = 20
+        self,
+        owner: str,
+        project_number: int,
+        limit: int = 20,
+        state: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Get items in a GitHub Project V2.
+        """Get items in a GitHub Project V2, optionally filtering by state.
 
         Args:
             owner: The GitHub organization or user name
             project_number: The project number
             limit: Maximum number of items to return (default: 20)
+            state: Optional state to filter items by (e.g., "OPEN", "CLOSED").
+                   Applies to linked Issues and Pull Requests.
 
         Returns:
             List of project items
@@ -367,112 +373,129 @@ class GitHubClient:
             logger.error(f"Cannot get items: {e}")
             raise
 
+        # Base query
         query = """
-        query GetProjectItems($projectId: ID!, $first: Int!) {
-          node(id: $projectId) {
-            ... on ProjectV2 {
-              items(first: $first) {
-                nodes {
+        query GetProjectItems($projectId: ID!, $first: Int!{query_params}) {{
+          node(id: $projectId) {{
+            ... on ProjectV2 {{
+              items(first: $first{filter_clause}) {{
+                nodes {{
                   id
                   type
-                  fieldValues(first: 20) {
-                    nodes {
-                      ... on ProjectV2ItemFieldTextValue {
+                  fieldValues(first: 20) {{
+                    nodes {{
+                      ... on ProjectV2ItemFieldTextValue {{
                         __typename
                         text
-                        field {
-                          ... on ProjectV2FieldCommon {
+                        field {{
+                          ... on ProjectV2FieldCommon {{
                             name
-                          }
-                        }
-                      }
-                      ... on ProjectV2ItemFieldDateValue {
+                          }}
+                        }}
+                      }}
+                      ... on ProjectV2ItemFieldDateValue {{
                         __typename
                         date
-                        field {
-                          ... on ProjectV2FieldCommon {
+                        field {{
+                          ... on ProjectV2FieldCommon {{
                             name
-                          }
-                        }
-                      }
-                      ... on ProjectV2ItemFieldSingleSelectValue {
+                          }}
+                        }}
+                      }}
+                      ... on ProjectV2ItemFieldSingleSelectValue {{
                         __typename
                         name
-                        field {
-                          ... on ProjectV2FieldCommon {
+                        field {{
+                          ... on ProjectV2FieldCommon {{
                             name
-                          }
-                        }
-                      }
+                          }}
+                        }}
+                      }}
                       # Add other field value types as needed
-                      ... on ProjectV2ItemFieldNumberValue {
+                      ... on ProjectV2ItemFieldNumberValue {{
                          __typename
                          number
-                         field {
-                           ... on ProjectV2FieldCommon {
+                         field {{
+                           ... on ProjectV2FieldCommon {{
                              name
-                           }
-                         }
-                       }
-                      ... on ProjectV2ItemFieldIterationValue {
+                           }}
+                         }}
+                       }}
+                      ... on ProjectV2ItemFieldIterationValue {{
                          __typename
                          title
                          startDate
                          duration
-                         field {
-                           ... on ProjectV2FieldCommon {
+                         field {{
+                           ... on ProjectV2FieldCommon {{
                              name
-                           }
-                         }
-                       }
-                    }
-                  }
-                  content {
-                    ... on Issue {
+                           }}
+                         }}
+                       }}
+                    }}
+                  }}
+                  content {{
+                    ... on Issue {{
                       __typename
                       id
                       number
                       title
                       state
                       url
-                      repository {
+                      repository {{
                         name
-                        owner {
+                        owner {{
                           login
-                        }
-                      }
-                    }
-                    ... on PullRequest {
+                        }}
+                      }}
+                    }}
+                    ... on PullRequest {{
                       __typename
                       id
                       number
                       title
                       state
                       url
-                      repository {
+                      repository {{
                         name
-                        owner {
+                        owner {{
                           login
-                        }
-                      }
-                    }
-                    ... on DraftIssue {
+                        }}
+                      }}
+                    }}
+                    ... on DraftIssue {{
                       __typename
                       id
                       title
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
+                    }}
+                  }}
+                }}
+              }}
+            }}
+          }}
+        }}
         """
 
-        variables = {"projectId": project_id, "first": limit}
+        # Prepare variables and query modifications for filtering
+        variables: Dict[str, Any] = {"projectId": project_id, "first": limit}
+        query_params = ""
+        filter_clause = ""
+
+        if state:
+            if state.upper() not in ["OPEN", "CLOSED"]:
+                raise ValueError("Invalid state filter. Must be 'OPEN' or 'CLOSED'.")
+            variables["stateFilter"] = [state.upper()]
+            query_params = ", $stateFilter: [ProjectV2ItemState!]"
+            # Note: GraphQL filter name is 'states', it takes a list
+            filter_clause = ", filterBy: {{ states: $stateFilter }}"
+
+        # Format the final query string
+        final_query = query.format(
+            query_params=query_params, filter_clause=filter_clause
+        )
 
         try:
-            result = await self.execute_query(query, variables)
+            result = await self.execute_query(final_query, variables)
             if not result.get("node") or not result["node"].get("items"):
                 raise GitHubClientError(
                     f"Could not retrieve items for project {owner}/{project_number}"
