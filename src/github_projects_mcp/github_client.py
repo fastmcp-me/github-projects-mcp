@@ -64,18 +64,29 @@ class GitHubClient:
                 response.raise_for_status()  # Raise HTTP errors
                 result = response.json()
 
+                # Check for errors AND the presence of data
                 if "errors" in result:
-                    error_message = f"GraphQL query errors: {result['errors']}"
-                    logger.error(error_message)
-                    raise GitHubClientError(error_message)
+                    data = result.get("data")
+                    if data is None:
+                        # No data returned, errors are fatal
+                        error_message = f"GraphQL query failed with errors and returned no data: {result['errors']}"
+                        logger.error(error_message)
+                        raise GitHubClientError(error_message)
+                    else:
+                        # Data IS present, log errors as warnings but proceed
+                        logger.warning(
+                            f"GraphQL query returned errors but also data: {result['errors']}"
+                        )
 
+                # If we reach here, either there were no errors, or there were errors but also data.
                 data = result.get("data")
                 if data is None:
-                    # Should not happen if no errors, but safeguard
+                    # This case should now only happen if there were no errors but still no data.
                     raise GitHubClientError(
                         "GraphQL query returned no data and no errors."
                     )
-                return data
+
+                return data  # Return data
         except httpx.HTTPStatusError as e:
             error_message = f"HTTP error executing GraphQL query: {e.response.status_code} - {e.response.text}"
             logger.error(error_message)
