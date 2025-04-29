@@ -15,36 +15,39 @@ GraphQL API for interacting with GitHub Projects V2.
 
 ## Setup
 
-1. Install dependencies:
+1. Clone the repository:
 
    ```
-   uv pip install .
+   git clone git@github.com:Rizz-Buzz/github-projects-mcp.git
+   cd github-projects-mcp
    ```
 
-   Or install direct dependencies:
+2. Create and activate a virtual environment:
 
    ```
-   uv pip install fastmcp httpx pydantic python-dotenv
+   uv venv
+   source venv/bin/activate
    ```
 
-2. Set your GitHub token as an environment variable:
+3. Install dependencies:
 
-   You need a GitHub Personal Access Token (PAT) with the required permissions.
-   You can create a new token here:
-   [Create a Github Personal Access Token](https://github.com/settings/personal-access-tokens/new)
+   ```
+   uv pip install -e .
+   ```
 
-   Once you have your token, export it:
+4. Set your GitHub token as an environment variable:
+
+   [Create a Github Personal Access Token](https://github.com/settings/personal-access-tokens/new), and give the necessary permissions.
+   The necessary permissions are: `repo`, `project`, and `read:org`.
+
+   Add the token to `.env` file after running command:
+
+   ```
+   cp .env.example .env
+   ```
 
    ```
    export GITHUB_TOKEN=your_personal_access_token
-   ```
-
-3. Run the server:
-
-   You can run the server directly using the Python module:
-
-   ```
-   python -m src.github_projects_mcp.server
    ```
 
 ## Usage
