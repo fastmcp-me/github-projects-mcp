@@ -96,6 +96,83 @@ class GitHubClient:
             logger.error(error_message)
             raise GitHubClientError(error_message) from e
 
+    async def _get_all_project_item_content_ids(
+        self, project_id: str
+    ) -> Dict[str, str]:
+        """Fetches all items in a project via pagination, returning map of Content ID -> Item ID."""
+        content_id_to_item_id: Dict[str, str] = {}
+        has_next_page = True
+        after_cursor = None
+        items_fetched = 0
+        max_items_to_scan = 1000  # Safety break for extremely large projects
+
+        logger.info(f"Fetching all item content IDs for project {project_id}...")
+
+        while has_next_page and items_fetched < max_items_to_scan:
+            query = """
+            query GetProjectItemIds($projectId: ID!, $first: Int!, $after: String) {
+              node(id: $projectId) {
+                ... on ProjectV2 {
+                  items(first: $first, after: $after) {
+                    pageInfo {
+                      hasNextPage
+                      endCursor
+                    }
+                    nodes {
+                      id # Project Item ID
+                      content {
+                        ... on Issue { id }
+                        ... on PullRequest { id }
+                        # Draft issues don't have searchable content ID here
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            """
+            variables: Dict[str, Any] = {
+                "projectId": project_id,
+                "first": 100,  # Fetch in batches of 100
+                "after": after_cursor,
+            }
+
+            try:
+                result = await self.execute_query(query, variables)
+                items_data = result.get("node", {}).get("items", {})
+                nodes = items_data.get("nodes", [])
+                page_info = items_data.get("pageInfo", {})
+
+                for node in nodes:
+                    item_id = node.get("id")
+                    content = node.get("content")
+                    if item_id and content and content.get("id"):
+                        content_id = content["id"]
+                        content_id_to_item_id[content_id] = item_id
+                        items_fetched += 1
+
+                has_next_page = page_info.get("hasNextPage", False)
+                after_cursor = page_info.get("endCursor")
+                logger.debug(
+                    f"Fetched page, hasNextPage: {has_next_page}, cursor: {after_cursor}, total fetched: {items_fetched}"
+                )
+
+            except GitHubClientError as e:
+                logger.error(f"Error fetching project item IDs page: {e}")
+                # Depending on the error, we might want to return partial results or raise
+                # For now, let's raise to indicate failure.
+                raise
+
+        if items_fetched >= max_items_to_scan:
+            logger.warning(
+                f"Stopped fetching project item IDs at {max_items_to_scan} items limit."
+            )
+
+        logger.info(
+            f"Finished fetching. Found {len(content_id_to_item_id)} linkable item IDs in project {project_id}."
+        )
+        return content_id_to_item_id
+
     async def get_projects(self, owner: str) -> List[Dict[str, Any]]:
         """Get Projects V2 for an organization or user.
 
@@ -994,44 +1071,40 @@ class GitHubClient:
         self, owner: str, project_number: int, search_query: str, limit: int = 10
     ) -> List[Dict[str, Any]]:
         """
-        Searches GitHub issues/PRs and returns items linked to the specified project.
+        Searches GitHub issues/PRs using GitHub Search API and returns project items
+        linked to the specified project that match the search results.
+        Does not find Draft Issues.
         """
         logger.info(
             f"Searching project {owner}/{project_number} for query: '{search_query}'"
         )
 
-        # --- Step 1: Get all item IDs and content IDs from the project ---
-        # Use high limit to get most/all items - needs pagination for large projects
+        # --- Step 1: Get Project ID ---
         try:
-            # Fetch more items than limit to ensure filtering is effective
-            # Consider adding pagination here for very large projects
-            all_project_items = await self.get_project_items(
-                owner, project_number, limit=100
-            )
-            project_item_map: Dict[str, Dict[str, Any]] = (
-                {}
-            )  # Map content_id -> item_data
-            content_ids_in_project = set()
-            for item in all_project_items:
-                content = item.get("content")
-                if content and content.get("id"):
-                    content_id = content["id"]
-                    content_ids_in_project.add(content_id)
-                    project_item_map[content_id] = item
-
-            if not content_ids_in_project:
-                logger.info("Project has no linkable items (Issues/PRs).")
-                return []
-
+            project_id = await self.get_project_node_id(owner, project_number)
         except GitHubClientError as e:
-            logger.error(f"Could not get project items for filter: {e}")
+            logger.error(f"Cannot search project: {e}")
+            raise
+
+        # --- Step 2: Get all linkable content IDs present in the project ---
+        try:
+            # This helper now uses pagination internally
+            content_id_to_project_item_id = (
+                await self._get_all_project_item_content_ids(project_id)
+            )
+            if not content_id_to_project_item_id:
+                logger.info(
+                    f"Project {owner}/{project_number} has no linkable items (Issues/PRs)."
+                )
+                return []
+            project_content_ids = set(content_id_to_project_item_id.keys())
+        except GitHubClientError as e:
+            logger.error(f"Could not get project item IDs for filtering: {e}")
             raise  # Re-raise the error
 
-        # --- Step 2: Perform GitHub Search ---
+        # --- Step 3: Perform GitHub Search ---
         # Add project owner context to search query if not already present
-        # Basic check, could be more robust
         scoped_query = search_query
-        # Heuristic: Check common qualifiers. Add org:/user: if none are present.
         if not any(
             q in search_query.lower()
             for q in [f"org:{owner}".lower(), f"user:{owner}".lower(), "repo:"]
@@ -1039,21 +1112,19 @@ class GitHubClient:
             scoped_query = f"org:{owner} {search_query}"  # Assume org context primarily
             logger.info(f"Scope not detected, searching within org/user: {owner}")
 
-        # Increase search result count to account for filtering
-        search_limit = min(limit * 5, 100)  # Fetch up to 5x needed, max 100 results
+        # Fetch more results than needed initially, as search is independent of the project
+        # We filter *afterwards* based on whether the found item is in the project.
+        # Max GitHub search results via API is 1000, but we limit to 100 per page.
+        # Let's fetch a reasonable amount to start.
+        search_limit = 100
 
         search_gql = """
         query SearchProjectIssues($query: String!, $first: Int!) {
           search(query: $query, type: ISSUE, first: $first) { # type: ISSUE searches both Issues and PRs
             nodes {
-              ... on Issue {
-                id
-                # Minimal fields needed for filtering
-              }
-              ... on PullRequest {
-                id
-                # Minimal fields needed for filtering
-              }
+              ... on Issue { id }
+              ... on PullRequest { id }
+              # We only need the ID for filtering against project content IDs
             }
           }
         }
@@ -1069,31 +1140,67 @@ class GitHubClient:
                     f"GitHub search returned no results for query: '{scoped_query}'"
                 )
                 return []
+            # Extract the node IDs from the search results
+            search_result_content_ids = {
+                node.get("id") for node in search_nodes if node.get("id")
+            }
 
         except GitHubClientError as e:
             logger.error(f"GitHub search failed: {e}")
             raise  # Re-raise the error
 
-        # --- Step 3: Filter search results against project items & map back ---
-        matching_items_data = []
-        found_content_ids = set()
+        # --- Step 4: Filter search results against project items ---
+        # Find the intersection: content IDs that are BOTH in search results AND in the project
+        matching_content_ids = list(
+            search_result_content_ids.intersection(project_content_ids)
+        )
 
-        for node in search_nodes:
-            node_id = node.get("id")
-            # Check if the found issue/PR ID is one linked to our project
-            if (
-                node_id
-                and node_id in content_ids_in_project
-                and node_id not in found_content_ids
-            ):
-                # Retrieve the full project item data we stored earlier
-                matching_items_data.append(project_item_map[node_id])
-                found_content_ids.add(node_id)
-                # Stop once we have enough results matching the requested limit
-                if len(matching_items_data) >= limit:
-                    break
+        if not matching_content_ids:
+            logger.info(
+                f"Search found issues/PRs, but none match items in project {owner}/{project_number}."
+            )
+            return []
+
+        # --- Step 5: Get full item details for the matching items ---
+        # We need the *project item IDs* corresponding to the matching *content IDs*
+        matching_project_item_ids = [
+            content_id_to_project_item_id[cid] for cid in matching_content_ids[:limit]
+        ]  # Apply limit here
+
+        # Fetch details for these specific item IDs (implementation requires a new helper or modification)
+        # For now, let's reuse the existing item fetch logic within a loop (less efficient but works)
+        # TODO: Implement a bulk item fetcher by ID (_get_project_items_by_id)
+        matching_items_details = []
+        logger.info(
+            f"Fetching details for {len(matching_project_item_ids)} matching project items..."
+        )
+        # We need the full item details, not just IDs. Re-fetch all items and filter again.
+        # This is inefficient, but avoids needing a new bulk fetch query for now.
+        try:
+            all_items_again = await self.get_project_items(
+                owner, project_number, limit=1000
+            )  # Use high limit
+            final_matched_items = []
+            ids_to_find = set(matching_project_item_ids)
+            for item in all_items_again:
+                item_id = item.get("id")  # Get ID first
+                # Check item_id is not None AND is in the set before removing
+                if item_id is not None and item_id in ids_to_find:
+                    final_matched_items.append(item)
+                    ids_to_find.remove(item_id)  # Now safe to remove
+                    if not ids_to_find:
+                        break  # Stop if we found all required items
+            if len(final_matched_items) != len(matching_project_item_ids):
+                logger.warning("Could not re-fetch details for all matching items.")
+            matching_items_details = final_matched_items[
+                :limit
+            ]  # Ensure limit is respected
+        except GitHubClientError as e:
+            logger.error(f"Failed to fetch full details for matching items: {e}")
+            # Return empty list or raise? Let's return empty for now.
+            return []
 
         logger.info(
-            f"Found {len(matching_items_data)} items matching query in project."
+            f"Found and retrieved {len(matching_items_details)} items matching query in project."
         )
-        return matching_items_data
+        return matching_items_details
