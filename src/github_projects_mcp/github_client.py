@@ -4,6 +4,7 @@ GitHub GraphQL API client for the GitHub Projects V2 MCP Server.
 
 import logging
 import os
+import re
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -95,83 +96,6 @@ class GitHubClient:
             error_message = f"Unexpected error executing GraphQL query: {str(e)}"
             logger.error(error_message)
             raise GitHubClientError(error_message) from e
-
-    async def _get_all_project_item_content_ids(
-        self, project_id: str
-    ) -> Dict[str, str]:
-        """Fetches all items in a project via pagination, returning map of Content ID -> Item ID."""
-        content_id_to_item_id: Dict[str, str] = {}
-        has_next_page = True
-        after_cursor = None
-        items_fetched = 0
-        max_items_to_scan = 1000  # Safety break for extremely large projects
-
-        logger.info(f"Fetching all item content IDs for project {project_id}...")
-
-        while has_next_page and items_fetched < max_items_to_scan:
-            query = """
-            query GetProjectItemIds($projectId: ID!, $first: Int!, $after: String) {
-              node(id: $projectId) {
-                ... on ProjectV2 {
-                  items(first: $first, after: $after) {
-                    pageInfo {
-                      hasNextPage
-                      endCursor
-                    }
-                    nodes {
-                      id # Project Item ID
-                      content {
-                        ... on Issue { id }
-                        ... on PullRequest { id }
-                        # Draft issues don't have searchable content ID here
-                      }
-                    }
-                  }
-                }
-              }
-            }
-            """
-            variables: Dict[str, Any] = {
-                "projectId": project_id,
-                "first": 100,  # Fetch in batches of 100
-                "after": after_cursor,
-            }
-
-            try:
-                result = await self.execute_query(query, variables)
-                items_data = result.get("node", {}).get("items", {})
-                nodes = items_data.get("nodes", [])
-                page_info = items_data.get("pageInfo", {})
-
-                for node in nodes:
-                    item_id = node.get("id")
-                    content = node.get("content")
-                    if item_id and content and content.get("id"):
-                        content_id = content["id"]
-                        content_id_to_item_id[content_id] = item_id
-                        items_fetched += 1
-
-                has_next_page = page_info.get("hasNextPage", False)
-                after_cursor = page_info.get("endCursor")
-                logger.debug(
-                    f"Fetched page, hasNextPage: {has_next_page}, cursor: {after_cursor}, total fetched: {items_fetched}"
-                )
-
-            except GitHubClientError as e:
-                logger.error(f"Error fetching project item IDs page: {e}")
-                # Depending on the error, we might want to return partial results or raise
-                # For now, let's raise to indicate failure.
-                raise
-
-        if items_fetched >= max_items_to_scan:
-            logger.warning(
-                f"Stopped fetching project item IDs at {max_items_to_scan} items limit."
-            )
-
-        logger.info(
-            f"Finished fetching. Found {len(content_id_to_item_id)} linkable item IDs in project {project_id}."
-        )
-        return content_id_to_item_id
 
     async def get_projects(self, owner: str) -> List[Dict[str, Any]]:
         """Get Projects V2 for an organization or user.
@@ -342,27 +266,23 @@ class GitHubClient:
             logger.error(error_message)
             raise GitHubClientError(error_message)
 
-    async def get_project_fields(
+    async def get_project_fields_details(
         self, owner: str, project_number: int
-    ) -> List[Dict[str, Any]]:
-        """Get fields for a GitHub Project V2.
-
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Get fields for a GitHub Project V2, returning a structured dictionary.
         Args:
             owner: The GitHub organization or user name
             project_number: The project number
-
         Returns:
-            List of fields
-
+            Dictionary mapping field name to its details (id, type, options).
         Raises:
             GitHubClientError: If project or fields cannot be retrieved.
         """
         try:
             project_id = await self.get_project_node_id(owner, project_number)
         except GitHubClientError as e:
-            logger.error(
-                f"Cannot get fields: {e}"
-            )  # Already logged in get_project_node_id
+            logger.error(f"Cannot get fields details: {e}")
             raise
 
         query = """
@@ -371,42 +291,22 @@ class GitHubClient:
             ... on ProjectV2 {
               fields(first: 50) {
                 nodes {
-                  ... on ProjectV2Field {
-                    id
-                    name
-                    __typename
-                  }
+                  ... on ProjectV2Field { id name __typename }
                   ... on ProjectV2IterationField {
-                    id
-                    name
-                    __typename
-                    configuration {
-                      iterations {
-                        id
-                        title
-                        startDate
-                        duration
-                      }
-                    }
+                     id name __typename
+                     configuration { iterations { id title startDate duration } }
                   }
                   ... on ProjectV2SingleSelectField {
-                    id
-                    name
-                    __typename
-                    options {
-                      id
-                      name
-                      color
-                      description
-                    }
+                     id name __typename
+                     options { id name color description }
                   }
+                  # Add other field types if needed
                 }
               }
             }
           }
         }
         """
-
         variables = {"projectId": project_id}
 
         try:
@@ -415,12 +315,38 @@ class GitHubClient:
                 raise GitHubClientError(
                     f"Could not retrieve fields for project {owner}/{project_number}"
                 )
-            return result["node"]["fields"]["nodes"]
+
+            fields_nodes = result["node"]["fields"]["nodes"]
+            field_details_map: Dict[str, Dict[str, Any]] = {}
+            for field in fields_nodes:
+                field_name = field.get("name")
+                if field_name:
+                    options_map = {}
+                    if field.get("options"):
+                        options_map = {
+                            opt["name"]: opt["id"] for opt in field["options"]
+                        }
+                    iterations_map = {}  # Placeholder for iteration options if needed
+
+                    field_details_map[field_name] = {
+                        "id": field.get("id"),
+                        "type": field.get("__typename"),
+                        "options": options_map,  # Map Name -> ID
+                        "iterations": iterations_map,
+                    }
+            return field_details_map
         except GitHubClientError as e:
             logger.error(
-                f"Failed to get fields for project {owner}/{project_number}: {e}"
+                f"Failed to get fields details for project {owner}/{project_number}: {e}"
             )
             raise
+        except Exception as e:  # Catch potential errors during processing
+            logger.error(
+                f"Unexpected error processing fields for project {owner}/{project_number}: {e}"
+            )
+            raise GitHubClientError(
+                f"Could not process fields for project {owner}/{project_number}"
+            )
 
     async def get_project_items(
         self,
@@ -428,21 +354,23 @@ class GitHubClient:
         project_number: int,
         limit: int = 20,
         state: Optional[str] = None,
+        filter_field_name: Optional[str] = None,
+        filter_field_value: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Get items in a GitHub Project V2, optionally filtering by state.
-
+        """
+        Get items in a GitHub Project V2, optionally filtering by state or a custom field value.
         Args:
             owner: The GitHub organization or user name
             project_number: The project number
             limit: Maximum number of items to return (default: 20)
             state: Optional state to filter items by (e.g., "OPEN", "CLOSED").
-                   Applies to linked Issues and Pull Requests.
-
+            filter_field_name: Optional name of a custom field to filter by (e.g., "Status").
+            filter_field_value: Optional value of the custom field to filter by (e.g., "Backlog").
         Returns:
             List of project items
-
         Raises:
-            GitHubClientError: If project or items cannot be retrieved.
+            GitHubClientError: If project or items cannot be retrieved, or filter is invalid.
+            ValueError: If filter parameters are invalid.
         """
         try:
             project_id = await self.get_project_node_id(owner, project_number)
@@ -450,102 +378,97 @@ class GitHubClient:
             logger.error(f"Cannot get items: {e}")
             raise
 
-        # Base query
-        query = """
+        # Prepare variables dict before use
+        variables: Dict[str, Any] = {"projectId": project_id, "first": limit}
+
+        # Base query definition including fragments
+        field_values_fragment = """
+        fragment FieldValuesFragment on ProjectV2ItemFieldValueConnection {
+            nodes {
+               ... on ProjectV2ItemFieldTextValue { __typename text field { ... on ProjectV2FieldCommon { name } } }
+               ... on ProjectV2ItemFieldDateValue { __typename date field { ... on ProjectV2FieldCommon { name } } }
+               ... on ProjectV2ItemFieldSingleSelectValue { __typename name field { ... on ProjectV2FieldCommon { name } } }
+               ... on ProjectV2ItemFieldNumberValue { __typename number field { ... on ProjectV2FieldCommon { name } } }
+               ... on ProjectV2ItemFieldIterationValue { __typename title startDate duration field { ... on ProjectV2FieldCommon { name } } }
+            }
+        }
+        """
+        content_fragment = """
+        fragment ContentFragment on ProjectV2ItemContent {
+           ... on Issue { __typename id number title state url repository { name owner { login } } }
+           ... on PullRequest { __typename id number title state url repository { name owner { login } } }
+           ... on DraftIssue { __typename id title body }
+        }
+        """
+        query_params_list = []
+        filter_conditions = []
+
+        if state:
+            if state.upper() not in ["OPEN", "CLOSED"]:
+                raise ValueError("Invalid state filter. Must be 'OPEN' or 'CLOSED'.")
+            variables["stateFilter"] = [state.upper()]
+            query_params_list.append("$stateFilter: [ProjectV2ItemState!]")
+            filter_conditions.append("states: $stateFilter")
+
+        if filter_field_name and filter_field_value:
+            try:
+                all_fields = await self.get_project_fields_details(
+                    owner, project_number
+                )
+                field_info = all_fields.get(filter_field_name)
+                if not field_info:
+                    raise ValueError(f"Field '{filter_field_name}' not found.")
+                field_id = field_info["id"]
+                field_type = field_info["type"]
+
+                if field_type == "ProjectV2SingleSelectField":
+                    option_id = field_info.get("options", {}).get(filter_field_value)
+                    if not option_id:
+                        raise ValueError(
+                            f"Option '{filter_field_value}' not found for field '{filter_field_name}'. Available: {list(field_info.get('options', {}).keys())}"
+                        )
+                    variables["fieldIdFilter"] = field_id
+                    variables["optionIdFilter"] = [option_id]
+                    query_params_list.append("$fieldIdFilter: ID!")
+                    query_params_list.append("$optionIdFilter: [ID!]")
+                    filter_conditions.append(
+                        "fieldValues: { fieldId: $fieldIdFilter, values: $optionIdFilter }"
+                    )
+                else:
+                    logger.warning(
+                        f"Filtering by field type '{field_type}' is not yet implemented."
+                    )
+            except GitHubClientError as e:
+                logger.error(f"Error during field lookup for filtering: {e}")
+                raise
+            except ValueError as e:
+                logger.error(f"Invalid filter input: {e}")
+                raise
+
+        query_params = ""
+        filter_clause = ""
+        if query_params_list:
+            query_params = ", " + ", ".join(query_params_list)
+        if filter_conditions:
+            filter_clause = f", filterBy: {{ {', '.join(filter_conditions)} }}"
+
+        # Use single curly braces for GraphQL, not double curly braces for f-string
+        query = f"""
+        {field_values_fragment}
+        {content_fragment}
         query GetProjectItems($projectId: ID!, $first: Int!{query_params}) {{
           node(id: $projectId) {{
             ... on ProjectV2 {{
               items(first: $first{filter_clause}) {{
+                pageInfo {{
+                  hasNextPage
+                  endCursor
+                }}
                 nodes {{
                   id
                   type
-                  fieldValues(first: 20) {{
-                    nodes {{
-                      ... on ProjectV2ItemFieldTextValue {{
-                        __typename
-                        text
-                        field {{
-                          ... on ProjectV2FieldCommon {{
-                            name
-                          }}
-                        }}
-                      }}
-                      ... on ProjectV2ItemFieldDateValue {{
-                        __typename
-                        date
-                        field {{
-                          ... on ProjectV2FieldCommon {{
-                            name
-                          }}
-                        }}
-                      }}
-                      ... on ProjectV2ItemFieldSingleSelectValue {{
-                        __typename
-                        name
-                        field {{
-                          ... on ProjectV2FieldCommon {{
-                            name
-                          }}
-                        }}
-                      }}
-                      # Add other field value types as needed
-                      ... on ProjectV2ItemFieldNumberValue {{
-                         __typename
-                         number
-                         field {{
-                           ... on ProjectV2FieldCommon {{
-                             name
-                           }}
-                         }}
-                       }}
-                      ... on ProjectV2ItemFieldIterationValue {{
-                         __typename
-                         title
-                         startDate
-                         duration
-                         field {{
-                           ... on ProjectV2FieldCommon {{
-                             name
-                           }}
-                         }}
-                       }}
-                    }}
-                  }}
-                  content {{
-                    ... on Issue {{
-                      __typename
-                      id
-                      number
-                      title
-                      state
-                      url
-                      repository {{
-                        name
-                        owner {{
-                          login
-                        }}
-                      }}
-                    }}
-                    ... on PullRequest {{
-                      __typename
-                      id
-                      number
-                      title
-                      state
-                      url
-                      repository {{
-                        name
-                        owner {{
-                          login
-                        }}
-                      }}
-                    }}
-                    ... on DraftIssue {{
-                      __typename
-                      id
-                      title
-                    }}
-                  }}
+                  fieldValues(first: 20) {{ ...FieldValuesFragment }}
+                  content {{ ...ContentFragment }}
                 }}
               }}
             }}
@@ -553,39 +476,42 @@ class GitHubClient:
         }}
         """
 
-        # Prepare variables and query modifications for filtering
-        variables: Dict[str, Any] = {"projectId": project_id, "first": limit}
-        query_params = ""
-        filter_clause = ""
-
-        if state:
-            if state.upper() not in ["OPEN", "CLOSED"]:
-                raise ValueError("Invalid state filter. Must be 'OPEN' or 'CLOSED'.")
-            variables["stateFilter"] = [state.upper()]
-            query_params = ", $stateFilter: [ProjectV2ItemState!]"
-            # Note: GraphQL filter name is 'states', it takes a list
-            filter_clause = ", filterBy: {{ states: $stateFilter }}"
-
-        # Format the final query string
-        final_query = query.format(
-            query_params=query_params, filter_clause=filter_clause
-        )
+        logger.debug(f"Executing items query: {query} with vars: {variables}")
 
         try:
-            result = await self.execute_query(final_query, variables)
-            if not result.get("node") or not result["node"].get("items"):
-                raise GitHubClientError(
-                    f"Could not retrieve items for project {owner}/{project_number}"
-                )
+            result = await self.execute_query(query, variables)
+            items_data = result.get("node", {}).get("items")
+            if items_data is None:  # Check if items key exists, even if null
+                if result.get("node") is None:
+                    raise GitHubClientError(
+                        f"Project node not found for {owner}/{project_number}"
+                    )
+                else:
+                    logger.info(
+                        f"No items found matching filter criteria for project {owner}/{project_number}"
+                    )
+                    return []  # Return empty list for no matches
 
-            items = result["node"]["items"]["nodes"]
-
-            # Process field values to make them easier to use
+            items = items_data.get("nodes", [])
+            # Process field values
             for item in items:
                 if item.get("fieldValues") and item["fieldValues"].get("nodes"):
                     processed_values = {}
                     for fv in item["fieldValues"]["nodes"]:
-                        field_name = fv.get("field", {}).get("name", "UnknownField")
+                        raw_field_name = fv.get("field", {}).get("name")
+                        # Sanitize the field name
+                        if raw_field_name:
+                            # Remove chars other than alphanumeric, space, underscore, hyphen
+                            sanitized_field_name = re.sub(
+                                r"[^\w\s-]", "", raw_field_name
+                            ).strip()
+                        else:
+                            sanitized_field_name = "UnknownField"
+
+                        field_name = (
+                            sanitized_field_name or "UnnamedField"
+                        )  # Ensure not empty
+
                         value = "N/A"
                         fv_type = fv.get("__typename")
                         if fv_type == "ProjectV2ItemFieldTextValue":
@@ -598,12 +524,8 @@ class GitHubClient:
                             value = fv.get("number", "N/A")
                         elif fv_type == "ProjectV2ItemFieldIterationValue":
                             value = f"{fv.get('title', 'N/A')} (Start: {fv.get('startDate', 'N/A')})"
-                        # Add other types as needed
                         processed_values[field_name] = value
-                    item["fieldValues"] = (
-                        processed_values  # Replace original list with dict
-                    )
-
+                    item["fieldValues"] = processed_values
             return items
         except GitHubClientError as e:
             logger.error(
@@ -1066,141 +988,3 @@ class GitHubClient:
         except GitHubClientError as e:
             logger.error(f"Failed to update project {project_number}: {e}")
             raise
-
-    async def search_and_filter_project_items(
-        self, owner: str, project_number: int, search_query: str, limit: int = 10
-    ) -> List[Dict[str, Any]]:
-        """
-        Searches GitHub issues/PRs using GitHub Search API and returns project items
-        linked to the specified project that match the search results.
-        Does not find Draft Issues.
-        """
-        logger.info(
-            f"Searching project {owner}/{project_number} for query: '{search_query}'"
-        )
-
-        # --- Step 1: Get Project ID ---
-        try:
-            project_id = await self.get_project_node_id(owner, project_number)
-        except GitHubClientError as e:
-            logger.error(f"Cannot search project: {e}")
-            raise
-
-        # --- Step 2: Get all linkable content IDs present in the project ---
-        try:
-            # This helper now uses pagination internally
-            content_id_to_project_item_id = (
-                await self._get_all_project_item_content_ids(project_id)
-            )
-            if not content_id_to_project_item_id:
-                logger.info(
-                    f"Project {owner}/{project_number} has no linkable items (Issues/PRs)."
-                )
-                return []
-            project_content_ids = set(content_id_to_project_item_id.keys())
-        except GitHubClientError as e:
-            logger.error(f"Could not get project item IDs for filtering: {e}")
-            raise  # Re-raise the error
-
-        # --- Step 3: Perform GitHub Search ---
-        # Add project owner context to search query if not already present
-        scoped_query = search_query
-        if not any(
-            q in search_query.lower()
-            for q in [f"org:{owner}".lower(), f"user:{owner}".lower(), "repo:"]
-        ):
-            scoped_query = f"org:{owner} {search_query}"  # Assume org context primarily
-            logger.info(f"Scope not detected, searching within org/user: {owner}")
-
-        # Fetch more results than needed initially, as search is independent of the project
-        # We filter *afterwards* based on whether the found item is in the project.
-        # Max GitHub search results via API is 1000, but we limit to 100 per page.
-        # Let's fetch a reasonable amount to start.
-        search_limit = 100
-
-        search_gql = """
-        query SearchProjectIssues($query: String!, $first: Int!) {
-          search(query: $query, type: ISSUE, first: $first) { # type: ISSUE searches both Issues and PRs
-            nodes {
-              ... on Issue { id }
-              ... on PullRequest { id }
-              # We only need the ID for filtering against project content IDs
-            }
-          }
-        }
-        """
-
-        search_vars = {"query": scoped_query, "first": search_limit}
-
-        try:
-            search_result_data = await self.execute_query(search_gql, search_vars)
-            search_nodes = search_result_data.get("search", {}).get("nodes", [])
-            if not search_nodes:
-                logger.info(
-                    f"GitHub search returned no results for query: '{scoped_query}'"
-                )
-                return []
-            # Extract the node IDs from the search results
-            search_result_content_ids = {
-                node.get("id") for node in search_nodes if node.get("id")
-            }
-
-        except GitHubClientError as e:
-            logger.error(f"GitHub search failed: {e}")
-            raise  # Re-raise the error
-
-        # --- Step 4: Filter search results against project items ---
-        # Find the intersection: content IDs that are BOTH in search results AND in the project
-        matching_content_ids = list(
-            search_result_content_ids.intersection(project_content_ids)
-        )
-
-        if not matching_content_ids:
-            logger.info(
-                f"Search found issues/PRs, but none match items in project {owner}/{project_number}."
-            )
-            return []
-
-        # --- Step 5: Get full item details for the matching items ---
-        # We need the *project item IDs* corresponding to the matching *content IDs*
-        matching_project_item_ids = [
-            content_id_to_project_item_id[cid] for cid in matching_content_ids[:limit]
-        ]  # Apply limit here
-
-        # Fetch details for these specific item IDs (implementation requires a new helper or modification)
-        # For now, let's reuse the existing item fetch logic within a loop (less efficient but works)
-        # TODO: Implement a bulk item fetcher by ID (_get_project_items_by_id)
-        matching_items_details = []
-        logger.info(
-            f"Fetching details for {len(matching_project_item_ids)} matching project items..."
-        )
-        # We need the full item details, not just IDs. Re-fetch all items and filter again.
-        # This is inefficient, but avoids needing a new bulk fetch query for now.
-        try:
-            all_items_again = await self.get_project_items(
-                owner, project_number, limit=1000
-            )  # Use high limit
-            final_matched_items = []
-            ids_to_find = set(matching_project_item_ids)
-            for item in all_items_again:
-                item_id = item.get("id")  # Get ID first
-                # Check item_id is not None AND is in the set before removing
-                if item_id is not None and item_id in ids_to_find:
-                    final_matched_items.append(item)
-                    ids_to_find.remove(item_id)  # Now safe to remove
-                    if not ids_to_find:
-                        break  # Stop if we found all required items
-            if len(final_matched_items) != len(matching_project_item_ids):
-                logger.warning("Could not re-fetch details for all matching items.")
-            matching_items_details = final_matched_items[
-                :limit
-            ]  # Ensure limit is respected
-        except GitHubClientError as e:
-            logger.error(f"Failed to fetch full details for matching items: {e}")
-            # Return empty list or raise? Let's return empty for now.
-            return []
-
-        logger.info(
-            f"Found and retrieved {len(matching_items_details)} items matching query in project."
-        )
-        return matching_items_details

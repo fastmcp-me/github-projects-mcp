@@ -70,40 +70,39 @@ async def list_projects(owner: str) -> str:
 
 @mcp.tool()
 async def get_project_fields(owner: str, project_number: int) -> str:
-    """Get fields available in a GitHub Project V2.
+    """Get fields available in a GitHub Project V2, including options for SingleSelect fields.
 
     Args:
         owner: The GitHub organization or user name
         project_number: The project number
 
     Returns:
-        A formatted string with field details
+        A formatted string with field details.
     """
     try:
-        fields = await github_client.get_project_fields(owner, project_number)
+        # Use the new method that returns structured data
+        fields_details = await github_client.get_project_fields_details(
+            owner, project_number
+        )
 
-        if not fields:
+        if not fields_details:
             return f"No fields found for project #{project_number} in {owner}"
 
         result = f"Fields for project #{project_number} in {owner}:\n\n"
-        for field in fields:
-            result += f"- ID: {field['id']}\n"
-            result += f"  Name: {field['name']}\n"
-            result += f"  Type: {field['__typename']}\n"
+        for field_name, details in fields_details.items():
+            result += f"- Name: {field_name}\n"
+            result += f"  ID: {details['id']}\n"
+            result += f"  Type: {details['type']}\n"
 
-            # If single select field, show options
-            if field.get("options"):
-                result += f"  Options:\n"
-                for option in field["options"]:
-                    result += f"    - {option['name']} (ID: {option['id']})\n"
+            # Show options if it's a SingleSelect field
+            if details["type"] == "ProjectV2SingleSelectField" and details.get(
+                "options"
+            ):
+                result += f"  Options (Name: ID):\n"
+                for opt_name, opt_id in details["options"].items():
+                    result += f"    - {opt_name}: {opt_id}\n"
 
-            # If iteration field, show iterations
-            if field.get("configuration") and field["configuration"].get("iterations"):
-                result += f"  Iterations:\n"
-                for iteration in field["configuration"]["iterations"]:
-                    result += f"    - {iteration.get('title', 'Unnamed')} "
-                    result += f"(ID: {iteration['id']}, "
-                    result += f"Start: {iteration.get('startDate', 'N/A')})\n"
+            # TODO: Add similar display for Iteration fields if needed
 
             result += "\n"
 
@@ -115,57 +114,80 @@ async def get_project_fields(owner: str, project_number: int) -> str:
 
 @mcp.tool()
 async def get_project_items(
-    owner: str, project_number: int, limit: int = 20, state: Optional[str] = None
+    owner: str,
+    project_number: int,
+    limit: int = 20,
+    state: Optional[str] = None,
+    filter_field_name: Optional[str] = None,  # New
+    filter_field_value: Optional[str] = None,  # New
 ) -> str:
-    """Get items in a GitHub Project V2.
+    """Get items in a GitHub Project V2. Can filter by state OR a single custom field=value.
 
     Args:
         owner: The GitHub organization or user name
         project_number: The project number
         limit: Maximum number of items to return (default: 20)
-        state: Optional state to filter items by (e.g., "OPEN", "CLOSED").
-               Applies only to linked Issues and Pull Requests, not Draft Issues.
+        state: Optional state filter (e.g., "OPEN", "CLOSED"). Applies to Issues/PRs.
+        filter_field_name: Optional custom field name to filter by (e.g., "Status"). Currently supports SingleSelect fields.
+        filter_field_value: Optional custom field value to filter by (e.g., "Backlog"). Use exact option name.
 
     Returns:
-        A formatted string with item details
+        A formatted string with item details.
     """
+    if state and filter_field_name:
+        return "Error: Cannot filter by both 'state' and a custom field ('filter_field_name') simultaneously."
+
     try:
         items = await github_client.get_project_items(
-            owner, project_number, limit, state
+            owner,
+            project_number,
+            limit,
+            state,
+            filter_field_name,  # Pass through
+            filter_field_value,  # Pass through
         )
 
-        if not items:
-            state_msg = f" with state '{state.upper()}'" if state else ""
-            return f"No items found in project #{project_number} for {owner}{state_msg}"
+        filter_desc = ""
+        if state:
+            filter_desc = f" (State: {state.upper()})"
+        elif filter_field_name and filter_field_value:
+            filter_desc = f" (Filter: {filter_field_name} = '{filter_field_value}')"
 
-        state_msg = f" (State: {state.upper()})" if state else ""
-        result = f"Items in project #{project_number} for {owner}{state_msg}:\n\n"
+        if not items:
+            return (
+                f"No items found in project #{project_number} for {owner}{filter_desc}"
+            )
+
+        # Format results
+        result = f"Items in project #{project_number} for {owner}{filter_desc}:\n\n"
         for item in items:
             content = item.get("content", {})
             result += f"- Item ID: {item['id']}\n"
-
-            # Handle different content types
             item_type = content.get("__typename")
+            repo_info = content.get("repository", {})
+            repo_str = (
+                f"{repo_info.get('owner', {}).get('login')}/{repo_info.get('name')}"
+                if repo_info
+                else "N/A"
+            )
+
             if item_type == "Issue":
-                result += f"  Type: Issue\n"
-                result += f"  Number: #{content.get('number')}\n"
+                result += f"  Type: Issue #{content.get('number')} ({repo_str})\n"
                 result += f"  Title: {content.get('title')}\n"
                 result += f"  State: {content.get('state')}\n"
                 result += f"  URL: {content.get('url')}\n"
-                repo_info = content.get("repository", {})
-                result += f"  Repo: {repo_info.get('owner', {}).get('login')}/{repo_info.get('name')}\n"
             elif item_type == "PullRequest":
-                result += f"  Type: Pull Request\n"
-                result += f"  Number: #{content.get('number')}\n"
+                result += f"  Type: PR #{content.get('number')} ({repo_str})\n"
                 result += f"  Title: {content.get('title')}\n"
                 result += f"  State: {content.get('state')}\n"
                 result += f"  URL: {content.get('url')}\n"
-                repo_info = content.get("repository", {})
-                result += f"  Repo: {repo_info.get('owner', {}).get('login')}/{repo_info.get('name')}\n"
             elif item_type == "DraftIssue":
-                result += f"  Type: Draft Issue\n"
-                result += f"  ID: {content.get('id')}\n"  # Use DraftIssue ID
+                # Include body for draft issues if available (check if client fetches it)
+                body = content.get("body", "")  # Assuming client might fetch body
+                result += f"  Type: Draft Issue ID: {content.get('id')}\n"
                 result += f"  Title: {content.get('title')}\n"
+                if body:
+                    result += f"  Body: {body[:100]}...\n"  # Show preview
             else:
                 result += f"  Type: {item_type or 'Unknown'}\n"
                 result += f"  Content: {json.dumps(content)}\n"
@@ -175,12 +197,16 @@ async def get_project_items(
                 result += f"  Field Values:\n"
                 for field_name, value in item["fieldValues"].items():
                     result += f"    - {field_name}: {value}\n"
-
             result += "\n"
 
         return result
-    except GitHubClientError as e:
-        logger.error(f"Error getting items for project {owner}/{project_number}: {e}")
+    except (
+        GitHubClientError,
+        ValueError,
+    ) as e:  # Catch client errors and validation errors
+        logger.error(
+            f"Error getting items for project {owner}/{project_number} with filter: {e}"
+        )
         return f"Error: Could not get items for project {owner}/{project_number}. Details: {e}"
 
 
@@ -353,86 +379,6 @@ async def delete_project_item(owner: str, project_number: int, item_id: str) -> 
             f"Error deleting item {item_id} from project {project_number}: {e}"
         )
         return f"Error: Could not delete item. Details: {e}"
-
-
-# --- Search Tool ---
-@mcp.tool()
-async def search_project_items(  # Note: Renamed from search_project_issues for clarity
-    owner: str, project_number: int, search_query: str, limit: int = 10
-) -> str:
-    """Search for Issues or Pull Requests within a specific GitHub Project V2 using GitHub's search syntax.
-
-    This searches across GitHub issues/PRs and filters for those linked to the project.
-    It WILL NOT find Draft Issues, as they are not searchable via the standard GitHub search.
-
-    Args:
-        owner: The GitHub organization or user name that owns the project.
-        project_number: The project number.
-        search_query: The search query string. Supports GitHub issue search syntax
-                      (e.g., "bug label:backend", "assignee:user state:open keyword").
-                      Use "repo:owner/repo-name" to scope the search for efficiency.
-        limit: Maximum number of *matching project items* to return (default: 10).
-
-    Returns:
-        A formatted string listing the project items matching the search query.
-    """
-    try:
-        # 1. Call the new github_client method
-        matching_items = await github_client.search_and_filter_project_items(
-            owner=owner,
-            project_number=project_number,
-            search_query=search_query,
-            limit=limit,
-        )
-
-        if not matching_items:
-            return f"No items found in project #{project_number} matching query: '{search_query}'"
-
-        # 2. Format the results (reuse formatting logic)
-        result = (
-            f"Found items in project #{project_number} matching '{search_query}':\n\n"
-        )
-        for item in matching_items:
-            content = item.get("content", {})
-            result += f"- Item ID: {item['id']}\n"
-            item_type = content.get("__typename")
-            repo_info = content.get("repository", {})
-            repo_str = (
-                f"{repo_info.get('owner', {}).get('login')}/{repo_info.get('name')}"
-                if repo_info
-                else "N/A"
-            )
-
-            if item_type == "Issue":
-                result += f"  Type: Issue #{content.get('number')} ({repo_str})\n"
-                result += f"  Title: {content.get('title')}\n"
-                result += f"  State: {content.get('state')}\n"
-                result += f"  URL: {content.get('url')}\n"
-            elif item_type == "PullRequest":
-                result += f"  Type: PR #{content.get('number')} ({repo_str})\n"
-                result += f"  Title: {content.get('title')}\n"
-                result += f"  State: {content.get('state')}\n"
-                result += f"  URL: {content.get('url')}\n"
-            # Draft issues are not searchable via this method
-            else:
-                result += f"  Type: {item_type or 'Unknown'}\n"
-                result += f"  Content: {json.dumps(content)}\n"
-
-            # Add field values if needed
-            if item.get("fieldValues"):
-                result += f"  Field Values:\n"
-                for field_name, value in item["fieldValues"].items():
-                    result += f"    - {field_name}: {value}\n"
-
-            result += "\n"
-        return result
-
-    except GitHubClientError as e:
-        logger.error(f"Error searching project {owner}/{project_number}: {e}")
-        return f"Error searching project items. Details: {e}"
-    except ValueError as e:  # Catch potential validation errors from client
-        logger.error(f"Invalid input for search: {e}")
-        return f"Error: Invalid search input. {e}"
 
 
 # --- Helper for updating project item field ---
