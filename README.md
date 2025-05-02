@@ -13,12 +13,44 @@ GraphQL API for interacting with GitHub Projects V2.
 - Update project item field values
 - Delete items from projects
 
-## Setup
+## Usage
+
+This server can be used with any MCP client, such as Claude Desktop. Add it to
+your MCP client configuration (e.g., `claude_desktop_config.json`).
+
+### Option 1: Using Published Package
+
+Here's an example configuration using `uvx` as the command runner:
+
+```json
+{
+  "mcpServers": {
+    "github-projects": {
+      "command": "uvx",
+      "args": [
+        "mcp-github-projects"
+      ],
+      "env": {
+        "GITHUB_TOKEN": "your_pat_here"
+      }
+    }
+  }
+}
+```
+
+Make sure to replace `your_pat_here` with your actual GitHub Personal Access
+Token.
+
+### Option 2: From Source Code
+
+To run the project directly from source code, follow these steps:
+
+#### Setup
 
 1. Clone the repository:
 
    ```
-   git clone git@github.com:Rizz-Buzz/github-projects-mcp.git
+   git clone git@github.com:Arclio/github-projects-mcp.git
    cd github-projects-mcp
    ```
 
@@ -37,47 +69,47 @@ GraphQL API for interacting with GitHub Projects V2.
 
 4. Set your GitHub token as an environment variable:
 
-   [Create a Github Personal Access Token](https://github.com/settings/personal-access-tokens/new), and give the necessary permissions.
-   The necessary permissions are: `repo`, `project`, and `read:org`.
+   [Create a GitHub Personal Access Token](https://github.com/settings/personal-access-tokens/new) and give it the necessary permissions.
+   The required permissions are: `repo`, `project`, and `read:org`.
 
-   Add the token to `.env` file after running command:
+
+   Add the token to your `.env` file after running this command:
 
    ```
    cp .env.example .env
    ```
 
+   Then add the following to your `.env` file:
+
    ```
    export GITHUB_TOKEN=your_personal_access_token
    ```
 
-## Usage
+### Usage from source code
 
-This server can be used with any MCP client, such as Claude Desktop. Add it to
-your MCP client configuration (e.g., `claude_desktop_config.json`).
+  When using from source code, configure your MCP client as follows:
 
-Here's an example configuration using `uv` as the command runner:
-
-```json
-{
-  "mcpServers": {
-    "github-projects": {
-      "command": "uv",
-      "args": [
-        "--directory",
-        "/path/to/github-projects-mcp",
-        "run",
-        "mcp-github-projects"
-      ],
-      "env": {
-        "GITHUB_TOKEN": "your_pat_here"
+  ```json
+  {
+    "mcpServers": {
+      "github-projects": {
+        "command": "uv",
+        "args": [
+          "--directory",
+          "/path/to/github-projects-mcp",
+          "run",
+          "mcp-github-projects"
+        ],
+        "env": {
+          "GITHUB_TOKEN": "your_pat_here"
+        }
       }
     }
   }
-}
-```
+  ```
 
-Make sure to replace `/path/to/github-projects-mcp` and `your_pat_here` with
-your actual repository path and GitHub Personal Access Token.
+  Make sure to replace `/path/to/github-projects-mcp` and `your_pat_here` with
+  your actual repository path and GitHub Personal Access Token.
 
 ## Available Tools
 
