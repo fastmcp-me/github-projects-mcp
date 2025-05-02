@@ -3,9 +3,12 @@
 name = "mcp-github-projects"
 version = "0.1.0"
 description = "MCP Server for interacting with GitHub Projects V2"
-requires-python = "==3.12.8" # Specify a reasonable minimum Python version
+requires-python = "==3.12.8"
+readme = "README.md"
+license = {file = "LICENSE"}
+
 authors = [
-    {name = "Hillary Kipkemoi", email = "hillary6k@gmail.com"},
+    {name = "Hillary Kipkemoi", email = "hillaryk2k@gmail.com"},
 ]
 dependencies = [
     "fastmcp>=2.2.0",
@@ -14,9 +17,9 @@ dependencies = [
     "python-dotenv>=1.0.0",
 ]
 
-[project.scripts]
-# If you want a command-line entry point later, you can add it here
-mcp-github-projects = "github_projects_mcp.server:main" # Assuming a main function
+[project.urls]
+Homepage = "https://github.com/Arclio/github-projects-mcp"
+Repository = "https://github.com/Arclio/github-projects-mcp.git"
 
 [build-system]
 requires = ["hatchling"]
@@ -27,3 +30,6 @@ allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/github_projects_mcp"]
+
+[project.scripts]
+mcp-github-projects = "github_projects_mcp.server:main"
