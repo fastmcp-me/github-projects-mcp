@@ -352,22 +352,26 @@ class GitHubClient:
         self,
         owner: str,
         project_number: int,
-        limit: int = 20,
+        limit: int = 10,
         state: Optional[str] = None,
         filter_field_name: Optional[str] = None,
         filter_field_value: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Get items in a GitHub Project V2, optionally filtering by state or a custom field value.
         Args:
             owner: The GitHub organization or user name
             project_number: The project number
-            limit: Maximum number of items to return (default: 20)
+            limit: Maximum number of items to return per page (default: 10)
             state: Optional state to filter items by (e.g., "OPEN", "CLOSED").
             filter_field_name: Optional name of a custom field to filter by (e.g., "Status").
             filter_field_value: Optional value of the custom field to filter by (e.g., "Backlog").
+            cursor: Optional cursor for pagination (default: None for first page)
         Returns:
-            List of project items
+            Dictionary containing:
+                - items: List of project items
+                - pageInfo: Information about pagination (hasNextPage, endCursor)
         Raises:
             GitHubClientError: If project or items cannot be retrieved, or filter is invalid.
             ValueError: If filter parameters are invalid.
@@ -380,6 +384,12 @@ class GitHubClient:
 
         # Prepare variables dict before use
         variables: Dict[str, Any] = {"projectId": project_id, "first": limit}
+
+        # Add cursor if provided (for pagination)
+        after_clause = ""
+        if cursor:
+            variables["cursor"] = cursor
+            after_clause = ", after: $cursor"
 
         # Base query definition including fragments
         field_values_fragment = """
@@ -400,15 +410,19 @@ class GitHubClient:
            ... on DraftIssue { __typename id title body }
         }
         """
-        query_params_list = []
+
+        # Build filter parameters if needed
         filter_conditions = []
 
         if state:
             if state.upper() not in ["OPEN", "CLOSED"]:
                 raise ValueError("Invalid state filter. Must be 'OPEN' or 'CLOSED'.")
-            variables["stateFilter"] = [state.upper()]
-            query_params_list.append("$stateFilter: [ProjectV2ItemState!]")
-            filter_conditions.append("states: $stateFilter")
+            # For state filtering, let's collect all items and filter afterwards
+            # as the API has changed how filtering works
+
+        # Variables for field-based filtering
+        field_id_var = None
+        option_id_var = None
 
         if filter_field_name and filter_field_value:
             try:
@@ -427,13 +441,8 @@ class GitHubClient:
                         raise ValueError(
                             f"Option '{filter_field_value}' not found for field '{filter_field_name}'. Available: {list(field_info.get('options', {}).keys())}"
                         )
-                    variables["fieldIdFilter"] = field_id
-                    variables["optionIdFilter"] = [option_id]
-                    query_params_list.append("$fieldIdFilter: ID!")
-                    query_params_list.append("$optionIdFilter: [ID!]")
-                    filter_conditions.append(
-                        "fieldValues: { fieldId: $fieldIdFilter, values: $optionIdFilter }"
-                    )
+                    field_id_var = field_id
+                    option_id_var = option_id
                 else:
                     logger.warning(
                         f"Filtering by field type '{field_type}' is not yet implemented."
@@ -445,21 +454,14 @@ class GitHubClient:
                 logger.error(f"Invalid filter input: {e}")
                 raise
 
-        query_params = ""
-        filter_clause = ""
-        if query_params_list:
-            query_params = ", " + ", ".join(query_params_list)
-        if filter_conditions:
-            filter_clause = f", filterBy: {{ {', '.join(filter_conditions)} }}"
-
         # Use single curly braces for GraphQL, not double curly braces for f-string
         query = f"""
         {field_values_fragment}
         {content_fragment}
-        query GetProjectItems($projectId: ID!, $first: Int!{query_params}) {{
+        query GetProjectItems($projectId: ID!, $first: Int!{', $cursor: String' if cursor else ''}) {{
           node(id: $projectId) {{
             ... on ProjectV2 {{
-              items(first: $first{filter_clause}) {{
+              items(first: $first{after_clause}) {{
                 pageInfo {{
                   hasNextPage
                   endCursor
@@ -490,13 +492,24 @@ class GitHubClient:
                     logger.info(
                         f"No items found matching filter criteria for project {owner}/{project_number}"
                     )
-                    return []  # Return empty list for no matches
+                    return {
+                        "items": [],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    }
 
+            # Get pagination info
+            page_info = items_data.get("pageInfo", {})
             items = items_data.get("nodes", [])
+
             # Process field values
+            filtered_items = []
             for item in items:
                 if item.get("fieldValues") and item["fieldValues"].get("nodes"):
                     processed_values = {}
+                    matches_field_filter = (
+                        False if (field_id_var and option_id_var) else True
+                    )
+
                     for fv in item["fieldValues"]["nodes"]:
                         raw_field_name = fv.get("field", {}).get("name")
                         # Sanitize the field name
@@ -520,13 +533,37 @@ class GitHubClient:
                             value = fv.get("date", "N/A")
                         elif fv_type == "ProjectV2ItemFieldSingleSelectValue":
                             value = fv.get("name", "N/A")
+                            # Check if this is the field we're filtering on
+                            if (
+                                field_id_var
+                                and option_id_var
+                                and field_name == filter_field_name
+                                and value == filter_field_value
+                            ):
+                                matches_field_filter = True
                         elif fv_type == "ProjectV2ItemFieldNumberValue":
                             value = fv.get("number", "N/A")
                         elif fv_type == "ProjectV2ItemFieldIterationValue":
                             value = f"{fv.get('title', 'N/A')} (Start: {fv.get('startDate', 'N/A')})"
                         processed_values[field_name] = value
+
                     item["fieldValues"] = processed_values
-            return items
+
+                    # Apply state filter if needed
+                    matches_state_filter = True
+                    if state and item.get("content"):
+                        content_state = item["content"].get("state")
+                        if content_state and content_state != state.upper():
+                            matches_state_filter = False
+
+                    if matches_field_filter and matches_state_filter:
+                        filtered_items.append(item)
+                else:
+                    # Items without field values are included only if we're not doing field filtering
+                    if not (field_id_var and option_id_var):
+                        filtered_items.append(item)
+
+            return {"items": filtered_items, "pageInfo": page_info}
         except GitHubClientError as e:
             logger.error(
                 f"Failed to get items for project {owner}/{project_number}: {e}"
