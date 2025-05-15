@@ -352,22 +352,26 @@ class GitHubClient:
         self,
         owner: str,
         project_number: int,
-        limit: int = 20,
+        limit: int = 10,
         state: Optional[str] = None,
         filter_field_name: Optional[str] = None,
         filter_field_value: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Get items in a GitHub Project V2, optionally filtering by state or a custom field value.
         Args:
             owner: The GitHub organization or user name
             project_number: The project number
-            limit: Maximum number of items to return (default: 20)
+            limit: Maximum number of items to return per page (default: 10)
             state: Optional state to filter items by (e.g., "OPEN", "CLOSED").
             filter_field_name: Optional name of a custom field to filter by (e.g., "Status").
             filter_field_value: Optional value of the custom field to filter by (e.g., "Backlog").
+            cursor: Optional cursor for pagination (default: None for first page)
         Returns:
-            List of project items
+            Dictionary containing:
+                - items: List of project items
+                - pageInfo: Information about pagination (hasNextPage, endCursor)
         Raises:
             GitHubClientError: If project or items cannot be retrieved, or filter is invalid.
             ValueError: If filter parameters are invalid.
@@ -380,6 +384,12 @@ class GitHubClient:
 
         # Prepare variables dict before use
         variables: Dict[str, Any] = {"projectId": project_id, "first": limit}
+
+        # Add cursor if provided (for pagination)
+        after_clause = ""
+        if cursor:
+            variables["cursor"] = cursor
+            after_clause = ", after: $cursor"
 
         # Base query definition including fragments
         field_values_fragment = """
@@ -448,10 +458,10 @@ class GitHubClient:
         query = f"""
         {field_values_fragment}
         {content_fragment}
-        query GetProjectItems($projectId: ID!, $first: Int!) {{
+        query GetProjectItems($projectId: ID!, $first: Int!{', $cursor: String' if cursor else ''}) {{
           node(id: $projectId) {{
             ... on ProjectV2 {{
-              items(first: $first) {{
+              items(first: $first{after_clause}) {{
                 pageInfo {{
                   hasNextPage
                   endCursor
@@ -482,8 +492,13 @@ class GitHubClient:
                     logger.info(
                         f"No items found matching filter criteria for project {owner}/{project_number}"
                     )
-                    return []  # Return empty list for no matches
+                    return {
+                        "items": [],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    }
 
+            # Get pagination info
+            page_info = items_data.get("pageInfo", {})
             items = items_data.get("nodes", [])
 
             # Process field values
@@ -548,7 +563,7 @@ class GitHubClient:
                     if not (field_id_var and option_id_var):
                         filtered_items.append(item)
 
-            return filtered_items
+            return {"items": filtered_items, "pageInfo": page_info}
         except GitHubClientError as e:
             logger.error(
                 f"Failed to get items for project {owner}/{project_number}: {e}"

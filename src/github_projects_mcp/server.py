@@ -98,7 +98,7 @@ async def get_project_fields(owner: str, project_number: int) -> str:
             if details["type"] == "ProjectV2SingleSelectField" and details.get(
                 "options"
             ):
-                result += f"  Options (Name: ID):\n"
+                result += "  Options (Name: ID):\n"
                 for opt_name, opt_id in details["options"].items():
                     result += f"    - {opt_name}: {opt_id}\n"
 
@@ -120,6 +120,7 @@ async def get_project_items(
     state: Optional[str] = None,
     filter_field_name: Optional[str] = None,  # New
     filter_field_value: Optional[str] = None,  # New
+    cursor: Optional[str] = None,  # For pagination
 ) -> str:
     """Get items in a GitHub Project V2. Can filter by state OR a single custom field=value.
 
@@ -130,6 +131,7 @@ async def get_project_items(
         state: Optional state filter (e.g., "OPEN", "CLOSED"). Applies to Issues/PRs.
         filter_field_name: Optional custom field name to filter by (e.g., "Status"). Currently supports SingleSelect fields.
         filter_field_value: Optional custom field value to filter by (e.g., "Backlog"). Use exact option name.
+        cursor: Optional cursor for pagination. Use value from previous results to get next page.
 
     Returns:
         A formatted string with item details.
@@ -138,14 +140,20 @@ async def get_project_items(
         return "Error: Cannot filter by both 'state' and a custom field ('filter_field_name') simultaneously."
 
     try:
-        items = await github_client.get_project_items(
+        result = await github_client.get_project_items(
             owner,
             project_number,
             limit,
             state,
             filter_field_name,  # Pass through
             filter_field_value,  # Pass through
+            cursor,  # Pass through for pagination
         )
+
+        items = result["items"]
+        page_info = result["pageInfo"]
+        has_next_page = page_info.get("hasNextPage", False)
+        end_cursor = page_info.get("endCursor")
 
         filter_desc = ""
         if state:
@@ -153,13 +161,18 @@ async def get_project_items(
         elif filter_field_name and filter_field_value:
             filter_desc = f" (Filter: {filter_field_name} = '{filter_field_value}')"
 
+        pagination_desc = ""
+        if cursor:
+            pagination_desc = " (continued)"
+
         if not items:
-            return (
-                f"No items found in project #{project_number} for {owner}{filter_desc}"
-            )
+            if cursor:
+                return f"No more items found in project #{project_number} for {owner}{filter_desc}"
+            else:
+                return f"No items found in project #{project_number} for {owner}{filter_desc}"
 
         # Format results
-        result = f"Items in project #{project_number} for {owner}{filter_desc}:\n\n"
+        result = f"Items in project #{project_number} for {owner}{filter_desc}{pagination_desc}:\n\n"
         for item in items:
             content = item.get("content", {})
             result += f"- Item ID: {item['id']}\n"
@@ -194,10 +207,18 @@ async def get_project_items(
 
             # Show processed field values
             if item.get("fieldValues"):
-                result += f"  Field Values:\n"
+                result += "  Field Values:\n"
                 for field_name, value in item["fieldValues"].items():
                     result += f"    - {field_name}: {value}\n"
             result += "\n"
+
+        # Add pagination info
+        if has_next_page and end_cursor:
+            result += "\n--- Pagination ---\n"
+            result += "More items available: Yes\n"
+            result += f"Next page cursor: {end_cursor}\n"
+            result += "To get the next page, use the cursor parameter:\n"
+            result += f"cursor: {end_cursor}\n"
 
         return result
     except (
