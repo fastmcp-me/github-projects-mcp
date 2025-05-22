@@ -20,7 +20,7 @@ load_dotenv()
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -116,21 +116,21 @@ async def get_project_fields(owner: str, project_number: int) -> str:
 async def get_project_items(
     owner: str,
     project_number: int,
-    limit: int = 20,
+    limit: int = 50,
     state: Optional[str] = None,
-    filter_field_name: Optional[str] = None,  # New
-    filter_field_value: Optional[str] = None,  # New
-    cursor: Optional[str] = None,  # For pagination
+    filter_field_name: Optional[str] = None,
+    filter_field_value: Optional[str] = None,
+    cursor: Optional[str] = None,
 ) -> str:
     """Get items in a GitHub Project V2. Can filter by state OR a single custom field=value.
 
     Args:
         owner: The GitHub organization or user name
         project_number: The project number
-        limit: Maximum number of items to return (default: 20)
+        limit: Maximum number of items to return (default: 50). When filtering, the system automatically fetches more items to improve efficiency.
         state: Optional state filter (e.g., "OPEN", "CLOSED"). Applies to Issues/PRs.
-        filter_field_name: Optional custom field name to filter by (e.g., "Status"). Currently supports SingleSelect fields.
-        filter_field_value: Optional custom field value to filter by (e.g., "Backlog"). Use exact option name.
+        filter_field_name: Optional custom field name to filter by (e.g., "Status"). Currently supports SingleSelect and Iteration fields.
+        filter_field_value: Optional custom field value to filter by (e.g., "In Development"). Uses case-insensitive matching.
         cursor: Optional cursor for pagination. Use value from previous results to get next page.
 
     Returns:
@@ -145,9 +145,9 @@ async def get_project_items(
             project_number,
             limit,
             state,
-            filter_field_name,  # Pass through
-            filter_field_value,  # Pass through
-            cursor,  # Pass through for pagination
+            filter_field_name,
+            filter_field_value,
+            cursor,
         )
 
         items = result["items"]
@@ -169,7 +169,53 @@ async def get_project_items(
             if cursor:
                 return f"No more items found in project #{project_number} for {owner}{filter_desc}"
             else:
-                return f"No items found in project #{project_number} for {owner}{filter_desc}"
+                # Add more context for debugging purposes when filtering returns no items
+                if filter_field_name and filter_field_value:
+                    # Get available fields and options to help debug
+                    try:
+                        fields_details = await github_client.get_project_fields_details(
+                            owner, project_number
+                        )
+                        field_info = None
+
+                        # Try to find the field case-insensitively
+                        for fname, finfo in fields_details.items():
+                            if fname.lower() == filter_field_name.lower():
+                                field_info = finfo
+                                break
+
+                        if field_info:
+                            field_type = field_info.get("type", "Unknown")
+                            if field_type == "ProjectV2SingleSelectField":
+                                available_options = list(
+                                    field_info.get("options", {}).keys()
+                                )
+                                return (
+                                    f"No items found in project #{project_number} for {owner}{filter_desc}\n\n"
+                                    f"Debug info:\n"
+                                    f"- Found field '{filter_field_name}' with type '{field_type}'\n"
+                                    f"- Available options: {available_options}\n"
+                                    f"- Note: Searched up to {limit} items. If the project has many items, some '{filter_field_value}' items might be beyond this scope.\n"
+                                    f"- Tip: Try increasing the limit parameter or check if the field value spelling is correct."
+                                )
+                            elif field_type == "ProjectV2IterationField":
+                                available_iterations = list(
+                                    field_info.get("iterations", {}).keys()
+                                )
+                                return (
+                                    f"No items found in project #{project_number} for {owner}{filter_desc}\n\n"
+                                    f"Debug info:\n"
+                                    f"- Found field '{filter_field_name}' with type '{field_type}'\n"
+                                    f"- Available iterations: {available_iterations}\n"
+                                    f"- Note: Searched up to {limit} items. If the project has many items, some '{filter_field_value}' items might be beyond this scope.\n"
+                                    f"- Tip: Try increasing the limit parameter or check if the field value spelling is correct."
+                                )
+                    except Exception as e:
+                        logger.warning(
+                            f"Could not get additional field details for debug info: {e}"
+                        )
+
+                return f"No items found in project #{project_number} for {owner}{filter_desc}\n\nNote: If the project has many items, try increasing the limit parameter to search more thoroughly."
 
         # Format results
         result = f"Items in project #{project_number} for {owner}{filter_desc}{pagination_desc}:\n\n"

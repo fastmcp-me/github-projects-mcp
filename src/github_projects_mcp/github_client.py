@@ -38,6 +38,26 @@ class GitHubClient:
             "Accept": "application/vnd.github.v4+json",
         }
 
+    def _find_case_insensitive_key(
+        self, dictionary: Dict[str, Any], key: str
+    ) -> Optional[str]:
+        """Find a key in a dictionary case-insensitively.
+
+        Args:
+            dictionary: Dictionary to search in
+            key: Key to find (case-insensitive)
+
+        Returns:
+            The actual key if found, None otherwise
+        """
+        if not key:
+            return None
+
+        for dict_key in dictionary:
+            if dict_key and key and dict_key.lower() == key.lower():
+                return dict_key
+        return None
+
     async def execute_query(
         self, query: str, variables: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
@@ -326,7 +346,20 @@ class GitHubClient:
                         options_map = {
                             opt["name"]: opt["id"] for opt in field["options"]
                         }
-                    iterations_map = {}  # Placeholder for iteration options if needed
+                    iterations_map = {}
+                    if field.get(
+                        "__typename"
+                    ) == "ProjectV2IterationField" and field.get(
+                        "configuration", {}
+                    ).get(
+                        "iterations"
+                    ):
+                        iterations = field.get("configuration", {}).get(
+                            "iterations", []
+                        )
+                        iterations_map = {
+                            iter["title"]: iter["id"] for iter in iterations
+                        }
 
                     field_details_map[field_name] = {
                         "id": field.get("id"),
@@ -382,8 +415,18 @@ class GitHubClient:
             logger.error(f"Cannot get items: {e}")
             raise
 
+        # When filtering, we need to fetch more items since many will be excluded
+        # Increase the fetch size to be more efficient
+        fetch_limit = limit
+        if filter_field_name and filter_field_value:
+            # Be more aggressive but respect GitHub's 100 record limit
+            fetch_limit = min(max(limit * 5, 50), 100)
+            logger.debug(
+                f"Filtering enabled: increasing fetch limit from {limit} to {fetch_limit}"
+            )
+
         # Prepare variables dict before use
-        variables: Dict[str, Any] = {"projectId": project_id, "first": limit}
+        variables: Dict[str, Any] = {"projectId": project_id, "first": fetch_limit}
 
         # Add cursor if provided (for pagination)
         after_clause = ""
@@ -429,20 +472,90 @@ class GitHubClient:
                 all_fields = await self.get_project_fields_details(
                     owner, project_number
                 )
+                logger.debug(f"All fields available: {list(all_fields.keys())}")
+
+                # First try exact match
                 field_info = all_fields.get(filter_field_name)
+                # If not found, try case-insensitive match
+                if not field_info:
+                    actual_field_name = self._find_case_insensitive_key(
+                        all_fields, filter_field_name
+                    )
+                    if actual_field_name:
+                        field_info = all_fields.get(actual_field_name)
+                        logger.info(
+                            f"Found field '{actual_field_name}' using case-insensitive match for '{filter_field_name}'"
+                        )
+
                 if not field_info:
                     raise ValueError(f"Field '{filter_field_name}' not found.")
                 field_id = field_info["id"]
                 field_type = field_info["type"]
 
+                logger.debug(
+                    f"Found field '{filter_field_name}' with ID {field_id} and type {field_type}"
+                )
+
                 if field_type == "ProjectV2SingleSelectField":
+                    available_options = list(field_info.get("options", {}).keys())
+                    logger.debug(
+                        f"Available options for '{filter_field_name}': {available_options}"
+                    )
+
+                    # First try exact match
                     option_id = field_info.get("options", {}).get(filter_field_value)
+                    # If not found, try case-insensitive match
+                    if not option_id:
+                        options = field_info.get("options", {})
+                        actual_option_name = self._find_case_insensitive_key(
+                            options, filter_field_value
+                        )
+                        if actual_option_name:
+                            option_id = options.get(actual_option_name)
+                            logger.info(
+                                f"Found option '{actual_option_name}' using case-insensitive match for '{filter_field_value}'"
+                            )
+
                     if not option_id:
                         raise ValueError(
-                            f"Option '{filter_field_value}' not found for field '{filter_field_name}'. Available: {list(field_info.get('options', {}).keys())}"
+                            f"Option '{filter_field_value}' not found for field '{filter_field_name}'. Available: {available_options}"
                         )
                     field_id_var = field_id
                     option_id_var = option_id
+                    logger.debug(
+                        f"Using field ID {field_id_var} with option ID {option_id_var} for filtering"
+                    )
+                elif field_type == "ProjectV2IterationField":
+                    available_iterations = list(field_info.get("iterations", {}).keys())
+                    logger.debug(
+                        f"Available iterations for '{filter_field_name}': {available_iterations}"
+                    )
+
+                    # First try exact match
+                    iteration_id = field_info.get("iterations", {}).get(
+                        filter_field_value
+                    )
+                    # If not found, try case-insensitive match
+                    if not iteration_id:
+                        iterations = field_info.get("iterations", {})
+                        actual_iteration_name = self._find_case_insensitive_key(
+                            iterations, filter_field_value
+                        )
+                        if actual_iteration_name:
+                            iteration_id = iterations.get(actual_iteration_name)
+                            logger.info(
+                                f"Found iteration '{actual_iteration_name}' using case-insensitive match for '{filter_field_value}'"
+                            )
+
+                    if not iteration_id:
+                        raise ValueError(
+                            f"Iteration '{filter_field_value}' not found for field '{filter_field_name}'. Available: {available_iterations}"
+                        )
+                    field_id_var = field_id
+                    option_id_var = iteration_id
+                    logger.debug(
+                        f"Using field ID {field_id_var} with iteration ID {option_id_var} for filtering"
+                    )
                 else:
                     logger.warning(
                         f"Filtering by field type '{field_type}' is not yet implemented."
@@ -482,6 +595,15 @@ class GitHubClient:
 
         try:
             result = await self.execute_query(query, variables)
+            if result is None:
+                logger.warning(
+                    f"Query returned None result for project {owner}/{project_number}"
+                )
+                return {
+                    "items": [],
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                }
+
             items_data = result.get("node", {}).get("items")
             if items_data is None:  # Check if items key exists, even if null
                 if result.get("node") is None:
@@ -501,16 +623,22 @@ class GitHubClient:
             page_info = items_data.get("pageInfo", {})
             items = items_data.get("nodes", [])
 
+            logger.debug(
+                f"Retrieved {len(items)} items from project {owner}/{project_number}"
+            )
+
             # Process field values
             filtered_items = []
             for item in items:
                 if item.get("fieldValues") and item["fieldValues"].get("nodes"):
+                    field_values = item["fieldValues"]["nodes"]
+
                     processed_values = {}
                     matches_field_filter = (
                         False if (field_id_var and option_id_var) else True
                     )
 
-                    for fv in item["fieldValues"]["nodes"]:
+                    for fv in field_values:
                         raw_field_name = fv.get("field", {}).get("name")
                         # Sanitize the field name
                         if raw_field_name:
@@ -537,14 +665,47 @@ class GitHubClient:
                             if (
                                 field_id_var
                                 and option_id_var
-                                and field_name == filter_field_name
-                                and value == filter_field_value
+                                and field_name
+                                and filter_field_name
+                                and field_name.lower() == filter_field_name.lower()
+                                and value
+                                and filter_field_value
+                                and value.lower() == filter_field_value.lower()
                             ):
                                 matches_field_filter = True
+                                logger.debug(
+                                    f"Found matching item with field '{field_name}' = '{value}'"
+                                )
+                            elif (
+                                field_id_var
+                                and option_id_var
+                                and field_name
+                                and filter_field_name
+                                and field_name.lower() == filter_field_name.lower()
+                            ):
+                                logger.debug(
+                                    f"Field name matched but value did not: '{value}' != '{filter_field_value}'"
+                                )
                         elif fv_type == "ProjectV2ItemFieldNumberValue":
                             value = fv.get("number", "N/A")
                         elif fv_type == "ProjectV2ItemFieldIterationValue":
-                            value = f"{fv.get('title', 'N/A')} (Start: {fv.get('startDate', 'N/A')})"
+                            title = fv.get("title", "N/A")
+                            value = f"{title} (Start: {fv.get('startDate', 'N/A')})"
+                            # Check if this is the field we're filtering on
+                            if (
+                                field_id_var
+                                and option_id_var
+                                and field_name
+                                and filter_field_name
+                                and field_name.lower() == filter_field_name.lower()
+                                and title
+                                and filter_field_value
+                                and title.lower() == filter_field_value.lower()
+                            ):
+                                matches_field_filter = True
+                                logger.debug(
+                                    f"Found matching item with iteration field '{field_name}' = '{title}'"
+                                )
                         processed_values[field_name] = value
 
                     item["fieldValues"] = processed_values
@@ -563,6 +724,30 @@ class GitHubClient:
                     if not (field_id_var and option_id_var):
                         filtered_items.append(item)
 
+            # When filtering, we may have fetched more than requested, so trim to the requested limit
+            if filter_field_name and filter_field_value and len(filtered_items) > limit:
+                filtered_items = filtered_items[:limit]
+                # Update pagination info to indicate there may be more filtered results
+                page_info = {
+                    "hasNextPage": True,
+                    "endCursor": page_info.get("endCursor"),
+                }
+
+            # Emergency check: if we're filtering and got very few results, warn that there might be more
+            if (
+                filter_field_name
+                and filter_field_value
+                and len(filtered_items) == 0
+                and len(items) >= fetch_limit
+                and fetch_limit < 100
+            ):
+                logger.warning(
+                    f"Found 0 filtered items but fetched the maximum ({fetch_limit}). There might be more items beyond this limit. Consider increasing the search scope."
+                )
+
+            logger.debug(
+                f"Filtered down to {len(filtered_items)} items for project {owner}/{project_number} using criteria field_name={filter_field_name}, field_value={filter_field_value}"
+            )
             return {"items": filtered_items, "pageInfo": page_info}
         except GitHubClientError as e:
             logger.error(
